@@ -1,62 +1,42 @@
-// graphics.c - VGA Graphics Operations for MS-DOS Mode 13h
-
 #include <dos.h>
-#include <conio.h>
 
-void set_mode(int mode) {
+// Function to initialize graphics mode 13h
+void initVGA() {
     union REGS regs;
-    regs.h.ah = 0x00; // Function to set video mode
-    regs.h.al = mode; // Mode 13h
+    regs.h.ah = 0;
+    regs.h.al = 13;  // Set to mode 13h
     int86(0x10, &regs, &regs);
 }
 
-void clear_screen() {
+// Function to set a pixel at (x, y) with a specific color
+void setPixel(int x, int y, int color) {
     asm {
-        mov ax, 0x00; // Function to Clear the Screen
-        mov bh, 0x00; // Attribute
-        mov cx, 0x0000; // Top-left corner (0,0)
-        mov dx, 0xFFFF; // Bottom-right corner (319,199)
-        int 0x10;
+        mov ax, 0xA000
+        mov es, ax        // Segment for video memory
+        mov di, y
+        shl di, 8
+        shl di, 6        // Multiply by 320 (screen width)
+        add di, x        // Add x coordinate
+        mov byte ptr es:[di], color
     }
 }
 
-void put_pixel(int x, int y, int color) {
-    int offset = (y * 320) + x;
-    *((unsigned char*)0xA0000000 + offset) = color;
-}
-
-void draw_line(int x1, int y1, int x2, int y2, int color) {
-    // Simple Bresenham's line algorithm implementation
-    int dx = abs(x2 - x1);
-    int dy = abs(y2 - y1);
-    int sx = x1 < x2 ? 1 : -1;
-    int sy = y1 < y2 ? 1 : -1;
-    int err = dx - dy;
-
-    while (1) {
-        put_pixel(x1, y1, color);
-        if (x1 == x2 && y1 == y2) break;
-        int err2 = err * 2;
-        if (err2 > -dy) {
-            err -= dy;
-            x1 += sx;
-        }
-        if (err2 < dx) {
-            err += dx;
-            y1 += sy;
-        }
+// Function to draw a vertical line from (x, y1) to (y2) with a specific color
+void drawVerticalLine(int x, int y1, int y2, int color) {
+    for (int y = y1; y <= y2; y++) {
+        setPixel(x, y, color);
     }
 }
 
-void wait_for_key() {
-    while (!kbhit()); // Wait for key hit
-    getch(); // Clear the key from the buffer
+// Function to clear the screen
+void clearScreen() {
+    memset((void*)0xA0000, 0, 64000);  // Clear all pixels to black
 }
 
-void main() {
-    set_mode(0x13); // Set mode 13h
-    clear_screen(); // Clear screen
-    draw_line(100, 100, 200, 150, 15); // Draw a line
-    wait_for_key(); // Wait for key press to exit
-    set_mode(0x03); // Return to text mode
+// Function to restore text mode
+void restoreTextMode() {
+    union REGS regs;
+    regs.h.ah = 0;
+    regs.h.al = 3;  // Set to text mode
+    int86(0x10, &regs, &regs);
 }
