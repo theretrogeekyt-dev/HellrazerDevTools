@@ -1,7 +1,4 @@
 /* 3D_MAZE - Phase 2 (C89-safe): 16.16 fixed-point raycaster (OpenWatcom 16-bit DOS)
-   + Less pixelated wall edges:
-     - distance shading
-     - edge darkening near grid boundaries
    - INT 9 key-down table
    - Doom-ish 35Hz tic movement
    - Mode 13h backbuffer + v-retrace blit
@@ -50,6 +47,7 @@ static fixed f_from_int(int v) { return ((fixed)v) << FIX_SHIFT; }
 static int   f_to_int(fixed v) { return (int)(v >> FIX_SHIFT); }
 
 static fixed fmul(fixed a, fixed b) {
+  /* OpenWatcom supports long long in 16-bit builds */
   return (fixed)(((long long)a * (long long)b) >> FIX_SHIFT);
 }
 
@@ -208,51 +206,6 @@ static unsigned char wall_color(unsigned char tile) {
     case 3: return 100;
     default: return 180;
   }
-}
-
-/* --- Less pixelated edges helpers --- */
-
-/* distance shading: darken color a bit with distance buckets */
-static unsigned char shade_by_dist(unsigned char base, fixed perpDist) {
-  unsigned long d;
-  unsigned char shade;
-
-  /* bucketize: larger shift = fewer buckets (faster) */
-  d = (unsigned long)(perpDist >> 12); /* ~distance scaled */
-  if (d > 700UL) d = 700UL;
-
-  shade = (unsigned char)(d >> 7); /* 0..5-ish */
-  if (shade > 7) shade = 7;
-
-  /* subtract small amount per bucket */
-  {
-    unsigned char sub;
-    sub = (unsigned char)(shade * 3);
-    if (base > sub) base = (unsigned char)(base - sub);
-  }
-  return base;
-}
-
-/* edge darkening: if hit is near tile boundary, darken a little */
-static unsigned char edge_darken(unsigned char col, fixed px, fixed py,
-                                 fixed rayDirX, fixed rayDirY, fixed perpDist, int side) {
-  fixed hitFrac;
-  fixed hitPos;
-
-  if (side == 0) {
-    hitPos = py + fmul(rayDirY, perpDist);
-  } else {
-    hitPos = px + fmul(rayDirX, perpDist);
-  }
-
-  hitFrac = (hitPos & (FIX_ONE - 1));
-
-  /* near boundary? (1/16th of a tile) */
-  if (hitFrac < (FIX_ONE >> 4) || hitFrac > (FIX_ONE - (FIX_ONE >> 4))) {
-    if (col > 8) col = (unsigned char)(col - 8);
-  }
-
-  return col;
 }
 
 static void clear_sky_floor(unsigned char sky, unsigned char floor) {
@@ -475,15 +428,7 @@ int main(void) {
 
           tile = world[mapY][mapX];
           col  = wall_color(tile);
-
-          /* classic side shading */
-          if (side == 1 && col > 18) col = (unsigned char)(col - 18);
-
-          /* distance shading */
-          col = shade_by_dist(col, perpDist);
-
-          /* edge darkening */
-          col = edge_darken(col, px, py, rayDirX, rayDirY, perpDist, side);
+          if (side == 1 && col > 20) col -= 20;
 
           vline4_bb(sx, yTop, yBot, col);
         }
