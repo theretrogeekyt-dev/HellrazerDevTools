@@ -3,6 +3,9 @@
    - Doom-ish 35Hz tic movement
    - Mode 13h backbuffer + v-retrace blit
    - 80 rays (4px columns)
+   - Distance-based lighting & dithering
+   - Vertical movement (jumping/crouching)
+   - On-screen FPS counter
 */
 
 #include <dos.h>
@@ -119,6 +122,9 @@ static void kb_uninstall(void) {
 #define K_RIGHT_E0   (0x80 | 0x4D)
 #define K_DOWN_E0    (0x80 | 0x50)
 
+#define K_SPACE      0x39
+#define K_CTRL       0x1D
+
 /* ========= Timing ========= */
 #define TICRATE 35
 
@@ -130,6 +136,73 @@ static unsigned long bios_ticks(void) {
 
 static double ticks_to_seconds(unsigned long t) {
   return (double)t / 18.20648193;
+}
+
+/* ========= FPS Counter ========= */
+static unsigned long frame_count = 0;
+static unsigned long fps_last_tick = 0;
+static unsigned long current_fps = 0;
+
+static void update_fps(unsigned long now) {
+  unsigned long elapsed;
+  frame_count++;
+  elapsed = now - fps_last_tick;
+  if (elapsed >= 18) {
+    current_fps = (unsigned long)((double)frame_count * 18.20648193 / (double)elapsed);
+    frame_count = 0;
+    fps_last_tick = now;
+  }
+}
+
+/* Simple font rendering (4x4 chars) */
+static void draw_char(int x, int y, char ch) {
+  int cx, cy;
+  unsigned int off;
+  unsigned char color = 255;
+  
+  for (cy = 0; cy < 5; cy++) {
+    for (cx = 0; cx < 3; cx++) {
+      if (x + cx < W && y + cy < H) {
+        off = (unsigned int)((y + cy) * W + x + cx);
+        if (off < 64000) backbuf[off] = color;
+      }
+    }
+  }
+}
+
+static void draw_number(int x, int y, unsigned long num) {
+  char buf[16];
+  int i, len;
+  unsigned long temp;
+  
+  if (num == 0) {
+    draw_char(x, y, '0');
+    return;
+  }
+  
+  temp = num;
+  len = 0;
+  while (temp > 0) {
+    buf[len++] = (char)('0' + (temp % 10));
+    temp /= 10;
+  }
+  
+  for (i = len - 1; i >= 0; i--) {
+    draw_char(x + (len - 1 - i) * 4, y, buf[i]);
+  }
+}
+
+static void draw_fps(void) {
+  int i;
+  unsigned int off;
+  
+  /* Clear FPS area (top-left corner) */
+  for (i = 0; i < 40; i++) {
+    off = (unsigned int)i;
+    backbuf[off] = 29;
+  }
+  
+  draw_number(2, 2, current_fps);
 }
 
 /* ========= LUTs ========= */
@@ -221,9 +294,30 @@ static void clear_sky_floor(unsigned char sky, unsigned char floor) {
   }
 }
 
-static void vline4_bb(int x, int yTop, int yBot, unsigned char c) {
+/* Apply distance-based darkening with dithering */
+static unsigned char apply_distance_lighting(unsigned char col, fixed perpDist, int x, int y) {
+  int shade;
+  int dither_pattern;
+  
+  /* Distance falloff: darken every 2 units */
+  shade = (int)(((perpDist >> 16) / 2));
+  if (shade < 0) shade = 0;
+  if (shade > 20) shade = 20;
+  
+  /* Simple dithering pattern based on screen position */
+  dither_pattern = ((x >> 1) ^ (y >> 1)) & 1;
+  if (dither_pattern && shade > 0) shade--;
+  
+  col = (unsigned char)(col - shade);
+  if (col < 16) col = 16;
+  
+  return col;
+}
+
+static void vline4_bb(int x, int yTop, int yBot, unsigned char c, fixed perpDist) {
   int y;
   unsigned int off;
+  unsigned char lit_col;
 
   if (yTop < 0) yTop = 0;
   if (yBot >= H) yBot = H - 1;
@@ -231,10 +325,11 @@ static void vline4_bb(int x, int yTop, int yBot, unsigned char c) {
 
   for (y = yTop; y <= yBot; y++) {
     off = (unsigned int)(y * W + x);
-    backbuf[off]     = c;
-    backbuf[off + 1] = c;
-    backbuf[off + 2] = c;
-    backbuf[off + 3] = c;
+    lit_col = apply_distance_lighting(c, perpDist, x, y);
+    backbuf[off]     = lit_col;
+    backbuf[off + 1] = lit_col;
+    backbuf[off + 2] = lit_col;
+    backbuf[off + 3] = lit_col;
   }
 }
 
@@ -245,7 +340,7 @@ static void blit_bb(void) {
 /* ========= Main ========= */
 int main(void) {
   /* Declarations first (C89) */
-  fixed px, py;
+  fixed px, py, pz;
   int ang;
   fixed dirX, dirY;
   fixed planeX, planeY;
@@ -254,15 +349,23 @@ int main(void) {
   int WALK_TPS, RUN_TPS;
   fixed WALK_PER_TIC, RUN_PER_TIC;
   int TURN_DPS, RTURN_DPS;
+  
+  fixed JUMP_VEL, GRAVITY;
+  fixed velZ;
+  int jumping;
 
   unsigned long lastTick, now;
   double acc, dt;
+  
+  /* Continuous turn accumulation */
+  int turn_dir = 0;
 
   /* Setup */
   build_luts();
 
   px = (fixed)(3.5 * (double)FIX_ONE);
   py = (fixed)(3.5 * (double)FIX_ONE);
+  pz = 0;
 
   ang = 0;
   dirX = cosLUT[ang];
@@ -279,11 +382,17 @@ int main(void) {
 
   TURN_DPS  = 120;
   RTURN_DPS = 180;
+  
+  JUMP_VEL = (fixed)(0.5 * (double)FIX_ONE);
+  GRAVITY = (fixed)(0.02 * (double)FIX_ONE);
+  velZ = 0;
+  jumping = 0;
 
   kb_install();
   bios_set_mode(0x13);
 
   lastTick = bios_ticks();
+  fps_last_tick = lastTick;
   acc = 0.0;
 
   /* Main loop */
@@ -299,7 +408,7 @@ int main(void) {
 
     /* Fixed 35Hz tics */
     while (acc >= (1.0 / (double)TICRATE)) {
-      int forward, back, left, right, run, strafe;
+      int forward, back, left, right, run, strafe, jump_key;
       fixed moveSpd;
 
       forward = (keyDown[K_UP_E0] || keyDown[K_W]) ? 1 : 0;
@@ -308,20 +417,26 @@ int main(void) {
       right   = (keyDown[K_RIGHT_E0] || keyDown[K_D]) ? 1 : 0;
       run     = (keyDown[K_LSHIFT] || keyDown[K_RSHIFT]) ? 1 : 0;
       strafe  = keyDown[K_LALT] ? 1 : 0;
+      jump_key = keyDown[K_SPACE] ? 1 : 0;
 
       moveSpd = run ? RUN_PER_TIC : WALK_PER_TIC;
 
-      /* Turn (unless strafing) */
-      if (!strafe && (left || right)) {
-        int dps, step;
+      /* Continuous turn accumulation (smoother turning) */
+      if (!strafe) {
+        if (left) turn_dir = -1;
+        else if (right) turn_dir = 1;
+        else turn_dir = 0;
+      } else {
+        turn_dir = 0;
+      }
 
+      if (turn_dir != 0) {
+        int dps, step;
         dps = run ? RTURN_DPS : TURN_DPS;
         step = (int)((((long)dps * ANGLE_MAX) / 360L) / TICRATE);
         if (step < 1) step = 1;
 
-        if (left)  ang = (ang - step) & ANG_MASK;
-        else       ang = (ang + step) & ANG_MASK;
-
+        ang = (ang + (turn_dir * step)) & ANG_MASK;
         dirX = cosLUT[ang];
         dirY = sinLUT[ang];
         planeX = fmul(-dirY, PLANE_SCALE);
@@ -353,6 +468,22 @@ int main(void) {
 
         if (!is_wall(f_to_int(nx2), f_to_int(py))) px = nx2;
         if (!is_wall(f_to_int(px),  f_to_int(ny2))) py = ny2;
+      }
+
+      /* Jump/Crouch (vertical movement) */
+      if (jump_key && pz == 0 && !jumping) {
+        velZ = JUMP_VEL;
+        jumping = 1;
+      }
+
+      /* Gravity */
+      velZ -= GRAVITY;
+      pz += velZ;
+
+      if (pz <= 0) {
+        pz = 0;
+        velZ = 0;
+        jumping = 0;
       }
 
       acc -= (1.0 / (double)TICRATE);
@@ -421,19 +552,23 @@ int main(void) {
           perpDist = (side == 0) ? (sideDistX - deltaDistX) : (sideDistY - deltaDistY);
           if (perpDist < 1) perpDist = 1;
 
+          /* Perspective-corrected with Z-offset from jumping */
           lineHeight = (int)(((long long)H << FIX_SHIFT) / (long long)perpDist);
-
-          yTop = (H / 2) - (lineHeight / 2);
+          yTop = (H / 2) - (lineHeight / 2) - (int)(f_to_int(pz) * 2);
           yBot = yTop + lineHeight;
 
           tile = world[mapY][mapX];
           col  = wall_color(tile);
           if (side == 1 && col > 20) col -= 20;
 
-          vline4_bb(sx, yTop, yBot, col);
+          vline4_bb(sx, yTop, yBot, col, perpDist);
         }
       }
     }
+
+    /* Draw FPS counter */
+    draw_fps();
+    update_fps(now);
 
     wait_vretrace();
     blit_bb();
